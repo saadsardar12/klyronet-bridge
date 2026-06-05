@@ -81,7 +81,17 @@ async function createSession(instanceId) {
     if (qr) {
       sessions[instanceId].status = 'qr_ready';
       sessions[instanceId].qr     = qr;
-      try { qrImages[instanceId] = await qrcode.toDataURL(qr); } catch(e) {}
+      try {
+        // Generate base64 PNG
+        qrImages[instanceId] = await qrcode.toDataURL(qr, { 
+          errorCorrectionLevel: 'M',
+          margin: 2,
+          width: 256
+        });
+      } catch(e) {
+        // Fallback: store raw QR string
+        qrImages[instanceId] = qr;
+      }
       console.log(`[${instanceId}] QR ready`);
     }
 
