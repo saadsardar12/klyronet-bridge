@@ -151,8 +151,10 @@ async function createSession(instanceId) {
       if (isJidGroup(jid))     continue;
       if (isJidBroadcast(jid)) continue;
 
-      // Get clean phone from JID
-      const phone = jidNormalizedUser(jid)?.split('@')[0] ?? jid.split('@')[0];
+      // Fix LID — use remoteJidAlt to get real phone number JID
+      // remoteJidAlt contains @s.whatsapp.net JID when remoteJid is @lid
+      const realJid = msg.key.remoteJidAlt || msg.key.remoteJid || jid;
+      const phone   = jidNormalizedUser(realJid)?.split('@')[0] ?? realJid.split('@')[0];
 
       // Get message content
       const contentType = getContentType(msg.message) ?? 'text';
@@ -263,6 +265,7 @@ app.post('/send', auth, async (req, res) => {
   }
   try {
     // Use proper JID format
+    // Always use @s.whatsapp.net for sending — never LID
     const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
     await s.socket.sendMessage(jid, { text: message });
     res.json({ success: true });
