@@ -56,16 +56,17 @@ async function createSession(instanceId) {
     logger,
     auth                : state,
     printQRInTerminal   : false,
-    // ── JID fix — use regular JID not LID ──────────────
     shouldIgnoreJid     : jid =>
       isJidBroadcast(jid) || isJidNewsletter(jid),
-    // Force standard JID mode
     mobile              : false,
     browser             : ['Klyronet', 'Chrome', '120.0.0'],
-    syncFullHistory     : false,
+    syncFullHistory     : true,   // fetch full message history
     markOnlineOnConnect : false,
     retryRequestDelayMs : 2000,
     maxMsgRetryCount    : 3,
+    getMessage          : async (key) => {
+      return { conversation: '' };
+    },
   });
 
   sessions[instanceId] = {
@@ -137,6 +138,39 @@ async function createSession(instanceId) {
 
   sock.ev.on('creds.update', saveCreds);
 
+  // ── HISTORY SYNC — fetch old messages on QR connect ───
+  sock.ev.on('messaging-history.set', async ({ messages: histMsgs, isLatest }) => {
+    console.log(`[${instanceId}] History sync: ${histMsgs.length} messages, isLatest: ${isLatest}`);
+    for (const msg of histMsgs) {
+      if (!msg.message) continue;
+      const jid = msg.key.remoteJid ?? '';
+      if (isJidGroup(jid) || isJidBroadcast(jid)) continue;
+
+      // Get real phone using all strategies
+      const realJid = msg.key.remoteJidAlt || msg.key.remoteJid || jid;
+      let phone = realJid.split('@')[0];
+      if (msg.key.senderPn) phone = msg.key.senderPn.replace(/[^0-9]/g, '');
+
+      const contentType = getContentType(msg.message) ?? 'text';
+      const body =
+        msg.message?.conversation ??
+        msg.message?.extendedTextMessage?.text ??
+        '[Message]';
+
+      const direction = msg.key.fromMe ? 'out' : 'in';
+
+      await notify(instanceId, 'message_received', {
+        from      : phone,
+        body,
+        type      : contentType,
+        timestamp : msg.messageTimestamp,
+        msgId     : msg.key.id,
+        direction,
+        isHistory : true,
+      });
+    }
+  });
+
   // ── INCOMING MESSAGES ──────────────────────────────────
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
@@ -151,10 +185,46 @@ async function createSession(instanceId) {
       if (isJidGroup(jid))     continue;
       if (isJidBroadcast(jid)) continue;
 
-      // Fix LID — use remoteJidAlt to get real phone number JID
-      // remoteJidAlt contains @s.whatsapp.net JID when remoteJid is @lid
-      const realJid = msg.key.remoteJidAlt || msg.key.remoteJid || jid;
-      const phone   = jidNormalizedUser(realJid)?.split('@')[0] ?? realJid.split('@')[0];
+      // Fix LID — multiple strategies to get real phone number
+      let phone = null;
+
+      // Strategy 1: remoteJidAlt (official fix)
+      if (msg.key.remoteJidAlt) {
+        phone = msg.key.remoteJidAlt.split('@')[0];
+      }
+
+      // Strategy 2: senderPn field
+      if (!phone && msg.key.senderPn) {
+        phone = msg.key.senderPn.replace(/[^0-9]/g, '');
+      }
+
+      // Strategy 3: check message pushName + contacts store
+      if (!phone && sock.store) {
+        try {
+          const contact = sock.store.contacts[jid];
+          if (contact?.id) phone = contact.id.split('@')[0];
+        } catch(e) {}
+      }
+
+      // Strategy 4: participant field for groups
+      if (!phone && msg.key.participant) {
+        const pAlt = msg.key.participantAlt || msg.key.participant;
+        phone = pAlt.split('@')[0];
+      }
+
+      // Strategy 5: decode from LID format (50015514923260 → strip prefix)
+      if (!phone || phone.startsWith('500')) {
+        const raw = jid.split('@')[0];
+        if (raw.includes(':')) {
+          phone = raw.split(':')[0];
+        } else {
+          phone = raw;
+        }
+      }
+
+      // Final cleanup
+      phone = phone?.replace(/[^0-9]/g, '') ?? jid.split('@')[0];
+      console.log(`[${instanceId}] JID: ${jid}, remoteJidAlt: ${msg.key.remoteJidAlt}, senderPn: ${msg.key.senderPn}, phone: ${phone}`);
 
       // Get message content
       const contentType = getContentType(msg.message) ?? 'text';
