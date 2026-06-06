@@ -1,6 +1,5 @@
 /**
- * Klyronet Baileys Bridge
- * Uses JID (not LID) for WhatsApp connections
+ * Klyronet Baileys Bridge — v7 with native LID fix
  * Deploy on Railway.app
  */
 
@@ -21,25 +20,53 @@ const {
   isJidNewsletter,
   jidNormalizedUser,
   getContentType,
-  proto,
 } = require('@whiskeysockets/baileys');
 
 const app = express();
 app.use(express.json());
 
-// ── CONFIG ────────────────────────────────────────────────
-const PORT        = process.env.PORT        || 3000;
-const WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://klyronet.com/api/wa/baileys-webhook.php';
-const AUTH_TOKEN  = process.env.AUTH_TOKEN  || 'klyronet-secret-2024';
-const SESS_DIR    = process.env.SESSIONS_DIR|| './sessions';
+const PORT        = process.env.PORT         || 3000;
+const WEBHOOK_URL = process.env.WEBHOOK_URL  || 'https://klyronet.com/api/wa/baileys-webhook.php';
+const AUTH_TOKEN  = process.env.AUTH_TOKEN   || 'klyronet-secret-2024';
+const SESS_DIR    = process.env.SESSIONS_DIR || './sessions';
 
 if (!fs.existsSync(SESS_DIR)) fs.mkdirSync(SESS_DIR, { recursive: true });
 
-const sessions = {}; // instanceId → { socket, status, phone, qr }
-const qrImages = {}; // instanceId → base64 QR
+const sessions = {};
+const qrImages = {};
 const logger   = pino({ level: 'silent' });
 
-// ── CREATE SESSION ────────────────────────────────────────
+// ── LID → Phone number mapping store ─────────────────────
+const lidToPhone = {}; // lid → real phone number
+
+function resolvePhone(msg, jid) {
+  // v7 native: remoteJidAlt has real @s.whatsapp.net when remoteJid is @lid
+  if (msg.key.remoteJidAlt) {
+    const phone = msg.key.remoteJidAlt.split('@')[0];
+    if (phone && !phone.startsWith('500')) {
+      // Cache LID → phone mapping
+      lidToPhone[jid.split('@')[0]] = phone;
+      return phone;
+    }
+  }
+
+  // v7 native: senderPn field
+  if (msg.key.senderPn) {
+    const phone = msg.key.senderPn.replace(/[^0-9]/g, '');
+    if (phone) {
+      lidToPhone[jid.split('@')[0]] = phone;
+      return phone;
+    }
+  }
+
+  // Check cached mapping
+  const lidKey = jid.split('@')[0];
+  if (lidToPhone[lidKey]) return lidToPhone[lidKey];
+
+  // Fallback: use raw JID number
+  return lidKey.split(':')[0];
+}
+
 async function createSession(instanceId) {
   if (sessions[instanceId]?.status === 'connected') {
     return { success: true, status: 'already_connected' };
@@ -51,53 +78,37 @@ async function createSession(instanceId) {
   const { state, saveCreds } = await useMultiFileAuthState(sessPath);
   const { version }          = await fetchLatestBaileysVersion();
 
+  console.log(`[${instanceId}] Using Baileys version: ${version.join('.')}`);
+
   const sock = makeWASocket({
     version,
     logger,
     auth                : state,
     printQRInTerminal   : false,
-    shouldIgnoreJid     : jid =>
-      isJidBroadcast(jid) || isJidNewsletter(jid),
+    shouldIgnoreJid     : jid => isJidBroadcast(jid) || isJidNewsletter(jid),
     mobile              : false,
     browser             : ['Klyronet', 'Chrome', '120.0.0'],
-    syncFullHistory     : true,   // fetch full message history
+    syncFullHistory     : true,
     markOnlineOnConnect : false,
     retryRequestDelayMs : 2000,
     maxMsgRetryCount    : 3,
-    getMessage          : async (key) => {
-      return { conversation: '' };
-    },
+    getMessage          : async () => ({ conversation: '' }),
   });
 
-  sessions[instanceId] = {
-    socket : sock,
-    status : 'connecting',
-    phone  : null,
-    qr     : null,
-  };
+  sessions[instanceId] = { socket: sock, status: 'connecting', phone: null, qr: null };
 
-  // ── CONNECTION EVENTS ─────────────────────────────────
+  // ── CONNECTION ────────────────────────────────────────
   sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
-
     if (qr) {
       sessions[instanceId].status = 'qr_ready';
       sessions[instanceId].qr     = qr;
       try {
-        // Generate base64 PNG
-        qrImages[instanceId] = await qrcode.toDataURL(qr, { 
-          errorCorrectionLevel: 'M',
-          margin: 2,
-          width: 256
-        });
-      } catch(e) {
-        // Fallback: store raw QR string
-        qrImages[instanceId] = qr;
-      }
+        qrImages[instanceId] = await qrcode.toDataURL(qr, { errorCorrectionLevel:'M', width:256 });
+      } catch(e) { qrImages[instanceId] = qr; }
       console.log(`[${instanceId}] QR ready`);
     }
 
     if (connection === 'open') {
-      // Get JID (not LID) — use jidNormalizedUser for clean JID
       const rawJid = sock.user?.id ?? '';
       const phone  = jidNormalizedUser(rawJid)?.split('@')[0]
                   ?? rawJid.split(':')[0]
@@ -116,19 +127,11 @@ async function createSession(instanceId) {
       const code   = lastDisconnect?.error?.output?.statusCode;
       const logout = code === DisconnectReason.loggedOut;
       console.log(`[${instanceId}] Closed. Code: ${code}. Logout: ${logout}`);
-
       sessions[instanceId].status = 'disconnected';
-      await notify(instanceId, 'connection_close', {
-        phone : sessions[instanceId].phone,
-        status: 'disconnected',
-        logout,
-      });
-
+      await notify(instanceId, 'connection_close', { phone: sessions[instanceId].phone, status:'disconnected', logout });
       if (!logout) {
-        // Auto reconnect after 5s
         setTimeout(() => createSession(instanceId), 5000);
       } else {
-        // Clean up session files on logout
         try { fs.rmSync(sessPath, { recursive: true, force: true }); } catch(e) {}
         delete sessions[instanceId];
         delete qrImages[instanceId];
@@ -138,35 +141,49 @@ async function createSession(instanceId) {
 
   sock.ev.on('creds.update', saveCreds);
 
-  // ── HISTORY SYNC — fetch old messages on QR connect ───
-  sock.ev.on('messaging-history.set', async ({ messages: histMsgs, isLatest }) => {
-    console.log(`[${instanceId}] History sync: ${histMsgs.length} messages, isLatest: ${isLatest}`);
-    for (const msg of histMsgs) {
+  // ── LID MAPPING — track contacts for phone resolution ─
+  sock.ev.on('contacts.update', (contacts) => {
+    for (const contact of contacts) {
+      if (contact.lid && contact.id) {
+        const lid   = contact.lid.split('@')[0];
+        const phone = contact.id.split('@')[0];
+        if (!phone.startsWith('500')) {
+          lidToPhone[lid] = phone;
+          console.log(`[${instanceId}] LID mapped: ${lid} → ${phone}`);
+        }
+      }
+    }
+  });
+
+  sock.ev.on('contacts.upsert', (contacts) => {
+    for (const contact of contacts) {
+      if (contact.lid && contact.id) {
+        const lid   = contact.lid.split('@')[0];
+        const phone = contact.id.split('@')[0];
+        if (!phone.startsWith('500')) {
+          lidToPhone[lid] = phone;
+        }
+      }
+    }
+  });
+
+  // ── HISTORY SYNC ──────────────────────────────────────
+  sock.ev.on('messaging-history.set', async ({ messages: histMsgs }) => {
+    console.log(`[${instanceId}] History: ${histMsgs.length} messages`);
+    for (const msg of histMsgs.slice(0, 100)) { // limit to 100 history msgs
       if (!msg.message) continue;
       const jid = msg.key.remoteJid ?? '';
       if (isJidGroup(jid) || isJidBroadcast(jid)) continue;
 
-      // Get real phone using all strategies
-      const realJid = msg.key.remoteJidAlt || msg.key.remoteJid || jid;
-      let phone = realJid.split('@')[0];
-      if (msg.key.senderPn) phone = msg.key.senderPn.replace(/[^0-9]/g, '');
-
-      const contentType = getContentType(msg.message) ?? 'text';
-      const body =
-        msg.message?.conversation ??
-        msg.message?.extendedTextMessage?.text ??
-        '[Message]';
+      const phone     = resolvePhone(msg, jid);
+      const body      = msg.message?.conversation ?? msg.message?.extendedTextMessage?.text ?? '';
+      if (!body) continue;
 
       const direction = msg.key.fromMe ? 'out' : 'in';
-
       await notify(instanceId, 'message_received', {
-        from      : phone,
-        body,
-        type      : contentType,
-        timestamp : msg.messageTimestamp,
-        msgId     : msg.key.id,
-        direction,
-        isHistory : true,
+        from: phone, body, type: 'text',
+        timestamp: msg.messageTimestamp,
+        msgId: msg.key.id, direction, isHistory: true,
       });
     }
   });
@@ -180,53 +197,11 @@ async function createSession(instanceId) {
       if (msg.key.fromMe) continue;
 
       const jid = msg.key.remoteJid ?? '';
+      if (isJidGroup(jid) || isJidBroadcast(jid)) continue;
 
-      // Skip groups and broadcasts — only 1-to-1 JIDs
-      if (isJidGroup(jid))     continue;
-      if (isJidBroadcast(jid)) continue;
+      // Resolve real phone number using v7 native fields
+      const phone = resolvePhone(msg, jid);
 
-      // Fix LID — multiple strategies to get real phone number
-      let phone = null;
-
-      // Strategy 1: remoteJidAlt (official fix)
-      if (msg.key.remoteJidAlt) {
-        phone = msg.key.remoteJidAlt.split('@')[0];
-      }
-
-      // Strategy 2: senderPn field
-      if (!phone && msg.key.senderPn) {
-        phone = msg.key.senderPn.replace(/[^0-9]/g, '');
-      }
-
-      // Strategy 3: check message pushName + contacts store
-      if (!phone && sock.store) {
-        try {
-          const contact = sock.store.contacts[jid];
-          if (contact?.id) phone = contact.id.split('@')[0];
-        } catch(e) {}
-      }
-
-      // Strategy 4: participant field for groups
-      if (!phone && msg.key.participant) {
-        const pAlt = msg.key.participantAlt || msg.key.participant;
-        phone = pAlt.split('@')[0];
-      }
-
-      // Strategy 5: decode from LID format (50015514923260 → strip prefix)
-      if (!phone || phone.startsWith('500')) {
-        const raw = jid.split('@')[0];
-        if (raw.includes(':')) {
-          phone = raw.split(':')[0];
-        } else {
-          phone = raw;
-        }
-      }
-
-      // Final cleanup
-      phone = phone?.replace(/[^0-9]/g, '') ?? jid.split('@')[0];
-      console.log(`[${instanceId}] JID: ${jid}, remoteJidAlt: ${msg.key.remoteJidAlt}, senderPn: ${msg.key.senderPn}, phone: ${phone}`);
-
-      // Get message content
       const contentType = getContentType(msg.message) ?? 'text';
       const body =
         msg.message?.conversation ??
@@ -237,17 +212,14 @@ async function createSession(instanceId) {
         (contentType === 'imageMessage'    ? '[Image]'         : null) ??
         (contentType === 'videoMessage'    ? '[Video]'         : null) ??
         (contentType === 'documentMessage' ? '[Document]'      : null) ??
-        (contentType === 'stickerMessage'  ? '[Sticker]'       : null) ??
         '[Message]';
 
-      console.log(`[${instanceId}] MSG from ${phone}: ${body.substring(0,60)}`);
+      console.log(`[${instanceId}] MSG from ${phone} (JID: ${jid}, alt: ${msg.key.remoteJidAlt}, pn: ${msg.key.senderPn}): ${body.substring(0,50)}`);
 
       await notify(instanceId, 'message_received', {
-        from     : phone,
-        body,
-        type     : contentType,
+        from: phone, body, type: contentType,
         timestamp: msg.messageTimestamp,
-        msgId    : msg.key.id,
+        msgId: msg.key.id,
       });
     }
   });
@@ -255,58 +227,42 @@ async function createSession(instanceId) {
   return { success: true, status: 'connecting' };
 }
 
-// ── NOTIFY PHP ────────────────────────────────────────────
 async function notify(instanceId, event, data) {
   try {
-    await axios.post(WEBHOOK_URL, {
-      instance: instanceId,
-      event,
-      ...data,
-    }, {
-      headers : { 'X-Auth-Token': AUTH_TOKEN },
-      timeout : 10000,
+    await axios.post(WEBHOOK_URL, { instance: instanceId, event, ...data }, {
+      headers: { 'X-Auth-Token': AUTH_TOKEN },
+      timeout: 10000,
     });
   } catch(e) {
     console.error(`[${instanceId}] Webhook failed:`, e.message);
   }
 }
 
-// ── AUTH MIDDLEWARE ───────────────────────────────────────
 function auth(req, res, next) {
   const t = req.headers['x-auth-token'] ?? req.query.token;
   if (t !== AUTH_TOKEN) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
 
-// ── ROUTES ────────────────────────────────────────────────
-
 app.get('/', (req, res) => res.json({
-  service : 'Klyronet Baileys Bridge',
-  status  : 'running',
+  service: 'Klyronet Baileys Bridge v7',
+  status : 'running',
   sessions: Object.keys(sessions).length,
 }));
 
-// Start instance
 app.post('/connect', auth, async (req, res) => {
   const { instance } = req.body;
   if (!instance) return res.status(400).json({ error: 'instance required' });
-  const r = await createSession(instance);
-  res.json(r);
+  res.json(await createSession(instance));
 });
 
-// Get QR
 app.get('/qr/:instance', auth, async (req, res) => {
   const { instance } = req.params;
-
   if (!sessions[instance]) await createSession(instance);
-
-  // Wait up to 15s for QR
   for (let i = 0; i < 30; i++) {
-    if (qrImages[instance]) break;
-    if (sessions[instance]?.status === 'connected') break;
+    if (qrImages[instance] || sessions[instance]?.status === 'connected') break;
     await new Promise(r => setTimeout(r, 500));
   }
-
   if (sessions[instance]?.status === 'connected') {
     return res.json({ status: 'connected', phone: sessions[instance].phone });
   }
@@ -316,14 +272,12 @@ app.get('/qr/:instance', auth, async (req, res) => {
   res.json({ status: 'connecting' });
 });
 
-// Status
 app.get('/status/:instance', auth, (req, res) => {
   const s = sessions[req.params.instance];
   if (!s) return res.json({ status: 'not_found' });
   res.json({ status: s.status, phone: s.phone });
 });
 
-// Send message
 app.post('/send', auth, async (req, res) => {
   const { instance, to, message } = req.body;
   if (!instance || !to || !message) {
@@ -334,8 +288,6 @@ app.post('/send', auth, async (req, res) => {
     return res.status(400).json({ error: 'Not connected' });
   }
   try {
-    // Use proper JID format
-    // Always use @s.whatsapp.net for sending — never LID
     const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
     await s.socket.sendMessage(jid, { text: message });
     res.json({ success: true });
@@ -344,7 +296,6 @@ app.post('/send', auth, async (req, res) => {
   }
 });
 
-// Disconnect
 app.post('/disconnect/:instance', auth, async (req, res) => {
   const s = sessions[req.params.instance];
   if (s?.socket) { try { await s.socket.logout(); } catch(e) {} }
@@ -353,7 +304,6 @@ app.post('/disconnect/:instance', auth, async (req, res) => {
   res.json({ success: true });
 });
 
-// List instances
 app.get('/instances', auth, (req, res) => {
   res.json({
     instances: Object.entries(sessions).map(([id, s]) => ({
@@ -362,7 +312,6 @@ app.get('/instances', auth, (req, res) => {
   });
 });
 
-// ── RESTORE SESSIONS ON STARTUP ───────────────────────────
 async function restore() {
   if (!fs.existsSync(SESS_DIR)) return;
   for (const dir of fs.readdirSync(SESS_DIR)) {
@@ -376,6 +325,6 @@ async function restore() {
 }
 
 app.listen(PORT, async () => {
-  console.log(`Klyronet Baileys Bridge on port ${PORT}`);
+  console.log(`Klyronet Baileys Bridge v7 on port ${PORT}`);
   await restore();
 });
